@@ -1,8 +1,8 @@
 import sys
 import keyboard
 from PIL.Image import Image
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QStyle, QInputDialog
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QStyle
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QSettings
 from PySide6.QtGui import QAction, QActionGroup
 
 from capture_service import CaptureService
@@ -14,7 +14,8 @@ class HotkeySignal(QObject):
     triggered = Signal()
 
 class ApiWorker(QThread):
-    finished = Signal(dict)
+    # 완료 시그널에 본인(worker 인스턴스)을 함께 넘겨서 컨트롤러가 검증하게 함
+    finished = Signal(dict, object)
     
     def __init__(self, image: Image, gemini_service: GeminiService, cache_service: CacheService, model_name: str):
         super().__init__()
@@ -22,50 +23,106 @@ class ApiWorker(QThread):
         self.gemini_service = gemini_service
         self.cache_service = cache_service
         self.model_name = model_name
+        self.is_cancelled = False # 취소 플래그
         
     def run(self):
         try:
-            # 1. Cache 조회
             cached_result = self.cache_service.get_cached_result(self.image, self.model_name)
-            
             if cached_result:
                 conf = cached_result.get('confidence', '')
                 if "Cached ⚡" not in conf:
                     cached_result['confidence'] = f"{conf} / Cached ⚡"
-                self.finished.emit(cached_result)
+                if not self.is_cancelled:
+                    self.finished.emit(cached_result, self)
                 return
 
-            # 2. Cache Miss 시 API 호출
             result = self.gemini_service.analyze_image(self.image, self.model_name)
             
-            # 3. 캐시에 저장
-            if result.get("answer") != "오류 발생":
+            if not self.is_cancelled and result.get("answer") != "오류 발생":
                 self.cache_service.save_result(self.image, result, self.model_name)
                 
-            self.finished.emit(result)
-            
+            if not self.is_cancelled:
+                self.finished.emit(result, self)
+                
         except Exception as e:
-            # 🚨 스레드 내부 크래시 방지 및 원인 출력 로직
-            import traceback
-            error_details = traceback.format_exc()
-            self.finished.emit({
-                "answer": "시스템 에러 발생",
+            if not self.is_cancelled:
+                import traceback
+                self.finished.emit({
+                    "answer": "시스템 에러 발생",
+                    "confidence": "low",
+                    "reason": f"오류: {str(e)}"
+                }, self)
+
+class AnalysisController(QObject):
+    def __init__(self, app_instance):
+        super().__init__()
+        self.app = app_instance
+        self.current_worker = None
+        
+        # 30초 타임아웃 타이머 설정
+        self.timeout_timer = QTimer()
+        self.timeout_timer.setSingleShot(True)
+        self.timeout_timer.timeout.connect(self.on_timeout)
+
+    def start_analysis(self, screenshot: Image):
+        # 1. 기존 작업이 돌고 있다면 플래그를 통해 취소 처리 (최신 요청만 처리)
+        if self.current_worker is not None:
+            self.current_worker.is_cancelled = True
+            self.current_worker = None
+            
+        self.app.panel.show_loading(self.app.display_mode)
+        
+        self.current_worker = ApiWorker(
+            screenshot, self.app.gemini_service, self.app.cache_service, self.app.current_model
+        )
+        self.current_worker.finished.connect(self.on_worker_finished)
+        self.current_worker.start()
+        
+        # 30초 타임아웃 시작
+        self.timeout_timer.start(30000)
+
+    def on_worker_finished(self, result: dict, worker: ApiWorker):
+        # 버려진(취소된) 워커의 시그널은 무시
+        if worker.is_cancelled or worker != self.current_worker:
+            return
+            
+        self.timeout_timer.stop()
+        self.app.panel.show_result(result, self.app.display_mode)
+        self.current_worker.deleteLater()
+        self.current_worker = None
+
+    def on_timeout(self):
+        if self.current_worker is not None:
+            self.current_worker.is_cancelled = True
+            self.current_worker = None
+            self.app.panel.show_result({
+                "answer": "Time Out",
                 "confidence": "low",
-                "reason": f"백그라운드 스레드에서 오류가 발생했습니다:\n{str(e)}\n\n(주요 원인: imagehash/numpy/scipy 모듈 누락, 또는 JSON 파일 쓰기 권한 부족)"
-            })
+                "reason": "API 요청이 30초를 초과하여 자동 취소되었습니다."
+            }, self.app.display_mode)
+
 
 class StudyAssistantApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
         
+        # --- QSettings: 설정 영속화 ---
+        self.settings = QSettings("MyStudyApp", "StudyAssistant")
+        self.display_mode = self.settings.value("display_mode", "full")
+        self.current_model = self.settings.value("current_model", "gemini-3.5-flash-lite")
+        
         self.capture_service = CaptureService()
         self.gemini_service = GeminiService()
         self.cache_service = CacheService()
         self.panel = AnswerPanel()
         
-        self.display_mode = "full"
-        self.current_model = "gemini-3.5-flash-lite" 
+        # 패널에 저장된 설정 주입
+        self.panel.set_theme(self.settings.value("theme", "dark"))
+        self.panel.set_opacity(float(self.settings.value("opacity", 0.75)))
+        self.panel.set_auto_close_time(int(self.settings.value("auto_close", 5)))
+        
+        self.controller = AnalysisController(self)
         
         self.setup_tray_icon()
         
@@ -77,107 +134,58 @@ class StudyAssistantApp:
         self.tray_icon = QSystemTrayIcon(self.app)
         icon = self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         self.tray_icon.setIcon(icon)
-        
         menu = QMenu()
         
-        # --- 1. 표시 모드 설정 ---
+        # --- 표시 모드 ---
         display_menu = menu.addMenu("표시 모드")
         display_group = QActionGroup(display_menu)
+        for text, val in [("정답 + 해설 표시", "full"), ("정답만 표시", "answer_only")]:
+            act = QAction(text, display_menu, checkable=True, checked=(self.display_mode == val))
+            act.triggered.connect(lambda checked, v=val: self.set_display_mode(v))
+            display_group.addAction(act)
+            display_menu.addAction(act)
         
-        full_mode_action = QAction("정답 + 해설 표시", display_menu, checkable=True, checked=True)
-        full_mode_action.triggered.connect(lambda: self.set_display_mode("full"))
-        display_group.addAction(full_mode_action)
-        
-        answer_mode_action = QAction("정답만 표시", display_menu, checkable=True)
-        answer_mode_action.triggered.connect(lambda: self.set_display_mode("answer_only"))
-        display_group.addAction(answer_mode_action)
-        
-        display_menu.addAction(full_mode_action)
-        display_menu.addAction(answer_mode_action)
-        
-        # --- 2. 테마 설정 (다크/라이트) ---
+        # --- 테마 설정 ---
         theme_menu = menu.addMenu("테마 설정")
         theme_group = QActionGroup(theme_menu)
-        
-        dark_action = QAction("다크 모드 (기본)", theme_menu, checkable=True, checked=True)
-        dark_action.triggered.connect(lambda: self.panel.set_theme("dark"))
-        theme_group.addAction(dark_action)
-        
-        light_action = QAction("라이트 모드", theme_menu, checkable=True)
-        light_action.triggered.connect(lambda: self.panel.set_theme("light"))
-        theme_group.addAction(light_action)
-        
-        theme_menu.addActions([dark_action, light_action])
-        
-        # --- 3. 투명도 설정 ---
+        current_theme = self.settings.value("theme", "dark")
+        for text, val in [("다크 모드", "dark"), ("라이트 모드", "light")]:
+            act = QAction(text, theme_menu, checkable=True, checked=(current_theme == val))
+            act.triggered.connect(lambda checked, v=val: self.set_theme(v))
+            theme_group.addAction(act)
+            theme_menu.addAction(act)
+            
+        # --- 투명도 설정 ---
         opacity_menu = menu.addMenu("투명도 설정")
-        opacity_group = QActionGroup(opacity_menu)
-        
-        op_100 = QAction("100% (불투명)", opacity_menu, checkable=True)
-        op_100.triggered.connect(lambda: self.panel.set_opacity(1.0))
-        opacity_group.addAction(op_100)
-        
-        op_75 = QAction("75% (기본)", opacity_menu, checkable=True, checked=True)
-        op_75.triggered.connect(lambda: self.panel.set_opacity(0.75))
-        opacity_group.addAction(op_75)
-        
-        op_50 = QAction("50%", opacity_menu, checkable=True)
-        op_50.triggered.connect(lambda: self.panel.set_opacity(0.50))
-        opacity_group.addAction(op_50)
-        
-        op_25 = QAction("25%", opacity_menu, checkable=True)
-        op_25.triggered.connect(lambda: self.panel.set_opacity(0.25))
-        opacity_group.addAction(op_25)
-        
-        op_0 = QAction("0% (완전 투명)", opacity_menu, checkable=True)
-        op_0.triggered.connect(lambda: self.panel.set_opacity(0.0))
-        opacity_group.addAction(op_0)
-        
-        opacity_menu.addActions([op_100, op_75, op_50, op_25, op_0])
-        
-        # --- 4. 자동 닫기 시간 설정 ---
+        op_group = QActionGroup(opacity_menu)
+        current_op = float(self.settings.value("opacity", 0.75))
+        for text, val in [("100% (불투명)", 1.0), ("75% (기본)", 0.75), ("50%", 0.5), ("25%", 0.25), ("0% (완전 투명)", 0.0)]:
+            act = QAction(text, opacity_menu, checkable=True, checked=(current_op == val))
+            act.triggered.connect(lambda checked, v=val: self.set_opacity(v))
+            op_group.addAction(act)
+            opacity_menu.addAction(act)
+            
+        # --- 자동 닫기 시간 ---
         time_menu = menu.addMenu("자동 닫기 시간")
         time_group = QActionGroup(time_menu)
-        
-        t_1 = QAction("1초", time_menu, checkable=True)
-        t_1.triggered.connect(lambda: self.panel.set_auto_close_time(1))
-        time_group.addAction(t_1)
-        
-        t_3 = QAction("3초", time_menu, checkable=True)
-        t_3.triggered.connect(lambda: self.panel.set_auto_close_time(3))
-        time_group.addAction(t_3)
-        
-        t_5 = QAction("5초 (기본)", time_menu, checkable=True, checked=True)
-        t_5.triggered.connect(lambda: self.panel.set_auto_close_time(5))
-        time_group.addAction(t_5)
-        
-        t_inf = QAction("닫을 때까지 표시", time_menu, checkable=True)
-        t_inf.triggered.connect(lambda: self.panel.set_auto_close_time(0))
-        time_group.addAction(t_inf)
-        
-        time_menu.addActions([t_1, t_3, t_5, t_inf])
-        
-        # --- 5. AI 모델 선택 설정 ---
+        current_time = int(self.settings.value("auto_close", 5))
+        for text, val in [("1초", 1), ("3초", 3), ("5초", 5), ("닫을 때까지 표시", 0)]:
+            act = QAction(text, time_menu, checkable=True, checked=(current_time == val))
+            act.triggered.connect(lambda checked, v=val: self.set_auto_close_time(v))
+            time_group.addAction(act)
+            time_menu.addAction(act)
+            
+        # --- AI 모델 ---
         model_menu = menu.addMenu("AI 모델 선택")
         model_group = QActionGroup(model_menu)
-        
-        lite_35_action = QAction("Gemini 3.5 Flash Lite (기본 / 500회)", model_menu, checkable=True, checked=True)
-        lite_35_action.triggered.connect(lambda: self.set_model("gemini-3.5-flash-lite"))
-        model_group.addAction(lite_35_action)
-        
-        lite_31_action = QAction("Gemini 3.1 Flash Lite (예비 / 500회)", model_menu, checkable=True)
-        lite_31_action.triggered.connect(lambda: self.set_model("gemini-3.1-flash-lite"))
-        model_group.addAction(lite_31_action)
-        
-        flash_38_action = QAction("Gemini 3.8 Flash (고성능 / 20회)", model_menu, checkable=True)
-        flash_38_action.triggered.connect(lambda: self.set_model("gemini-3.8-flash"))
-        model_group.addAction(flash_38_action)
-        
-        model_menu.addAction(lite_35_action)
-        model_menu.addAction(lite_31_action)
-        model_menu.addAction(flash_38_action)
-        
-        # --- 6. 종료 ---
+        for text, val in [("Gemini 3.5 Flash Lite", "gemini-3.5-flash-lite"), 
+                          ("Gemini 3.1 Flash Lite", "gemini-3.1-flash-lite"),
+                          ("Gemini 3.8 Flash", "gemini-3.8-flash")]:
+            act = QAction(text, model_menu, checkable=True, checked=(self.current_model == val))
+            act.triggered.connect(lambda checked, v=val: self.set_model(v))
+            model_group.addAction(act)
+            model_menu.addAction(act)
+            
         menu.addSeparator()
         exit_action = QAction("종료", menu)
         exit_action.triggered.connect(self.quit_app)
@@ -186,31 +194,35 @@ class StudyAssistantApp:
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.show()
 
+    # --- 설정 변경 및 QSettings 저장 로직 ---
     def set_display_mode(self, mode: str):
         self.display_mode = mode
+        self.settings.setValue("display_mode", mode)
+        
+    def set_theme(self, theme: str):
+        self.panel.set_theme(theme)
+        self.settings.setValue("theme", theme)
+        
+    def set_opacity(self, ratio: float):
+        self.panel.set_opacity(ratio)
+        self.settings.setValue("opacity", ratio)
+        
+    def set_auto_close_time(self, seconds: int):
+        self.panel.set_auto_close_time(seconds)
+        self.settings.setValue("auto_close", seconds)
         
     def set_model(self, model_name: str):
         self.current_model = model_name
+        self.settings.setValue("current_model", model_name)
 
     def quit_app(self):
         self.tray_icon.hide()
         self.app.quit()
 
     def on_hotkey_pressed(self):
-        # 1. 화면 캡처를 가장 먼저 실행 (UI 간섭 완벽 배제)
         screenshot = self.capture_service.capture_full_screen()
-        
-        # 2. 캡처가 끝난 후 로딩 패널 표시
-        self.panel.show_loading(self.display_mode)
-        
-        # 3. 워커 스레드 시작
-        self.worker = ApiWorker(screenshot, self.gemini_service, self.cache_service, self.current_model)
-        self.worker.finished.connect(self.on_api_finished)
-        self.worker.start()
-        
-    def on_api_finished(self, result: dict):
-        self.panel.show_result(result, self.display_mode)
-        self.worker.deleteLater()
+        # 모든 제어를 AnalysisController에 위임
+        self.controller.start_analysis(screenshot)
         
     def run(self):
         sys.exit(self.app.exec())

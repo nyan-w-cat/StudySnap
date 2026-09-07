@@ -1,55 +1,56 @@
 import os
+import sqlite3
 import json
 import imagehash
 from PIL.Image import Image
-
-# 1. Normalizer 임포트
 from image_normalizer import ImageNormalizer
 
 class CacheService:
-    def __init__(self, cache_file="problem_cache.json", threshold=12):
-        self.cache_file = cache_file
+    def __init__(self, db_file="problem_cache.db", threshold=12):
+        self.db_file = db_file
         self.threshold = threshold
-        self.cache_data = self._load_cache()
-        # 2. 인스턴스화
         self.normalizer = ImageNormalizer()
+        self._init_db()
 
-    def _load_cache(self) -> dict:
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"캐시 로드 실패: {e}")
-                return {}
-        return {}
-
-    def _save_cache(self):
-        with open(self.cache_file, "w", encoding="utf-8") as f:
-            json.dump(self.cache_data, f, ensure_ascii=False, indent=2)
+    def _init_db(self):
+        """SQLite 데이터베이스 및 테이블 초기화"""
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS problem_cache (
+                    hash_str TEXT,
+                    model TEXT,
+                    result_json TEXT
+                )
+            ''')
+            # 검색 속도 향상을 위해 모델에 인덱스 생성
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_model ON problem_cache(model)')
 
     def get_cached_result(self, image: Image, current_model: str) -> dict:
-        # 3. 해시 계산 전 이미지를 크롭(정규화)합니다. ⚡
         normalized_img = self.normalizer.normalize_for_hash(image)
         current_hash = imagehash.phash(normalized_img)
         
-        for stored_hash_str, result in self.cache_data.items():
-            stored_hash = imagehash.hex_to_hash(stored_hash_str)
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            # 현재 모델로 저장된 캐시만 1차 필터링하여 가져옴
+            cursor.execute("SELECT hash_str, result_json FROM problem_cache WHERE model = ?", (current_model,))
+            rows = cursor.fetchall()
             
-            if current_hash - stored_hash <= self.threshold:
-                if result.get("model") == current_model:
-                    return result 
-                else:
-                    return None 
-                
+            for hash_str, result_json in rows:
+                stored_hash = imagehash.hex_to_hash(hash_str)
+                # 2차 판별: 해밍 거리 계산
+                if current_hash - stored_hash <= self.threshold:
+                    return json.loads(result_json)
+                    
         return None
 
     def save_result(self, image: Image, result: dict, current_model: str):
-        # 4. 저장할 때도 정규화된 이미지의 해시를 키로 사용합니다. ⚡
         normalized_img = self.normalizer.normalize_for_hash(image)
         current_hash = imagehash.phash(normalized_img)
-        
         result["model"] = current_model
         
-        self.cache_data[str(current_hash)] = result
-        self._save_cache()
+        with sqlite3.connect(self.db_file) as conn:
+            # 해시와 모델, JSON 문자열을 안전하게 DB에 Insert
+            conn.execute(
+                "INSERT INTO problem_cache (hash_str, model, result_json) VALUES (?, ?, ?)",
+                (str(current_hash), current_model, json.dumps(result, ensure_ascii=False))
+            )
