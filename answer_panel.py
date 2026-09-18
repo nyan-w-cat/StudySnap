@@ -7,13 +7,15 @@ class AnswerPanel(QWidget):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(420, 160)
+        
+        # 🚨 수정됨: 너비만 420으로 고정하고 높이는 내용물에 따라 동적으로 변하게 함
+        self.setFixedWidth(420)
         self.setStyleSheet("background: transparent;")
         
         self.current_alpha_ratio = 0.75 
         self.auto_close_seconds = 5 
         self.current_theme = "dark" 
-        self.current_answer_text = "" # 클립보드 복사용 변수
+        self.current_answer_text = ""
         
         self.init_ui()
         self.position_bottom_right()
@@ -30,6 +32,9 @@ class AnswerPanel(QWidget):
         layout.setContentsMargins(15, 15, 15, 15)
         
         self.status_label = QLabel("Ready")
+        # 🚨 추가됨: 정답이 길어질 경우를 대비해 정답 라벨도 자동 줄바꿈 허용
+        self.status_label.setWordWrap(True)
+        
         self.reason_label = QLabel("대기 중...")
         self.reason_label.setWordWrap(True)
         self.reason_label.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -37,7 +42,6 @@ class AnswerPanel(QWidget):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         
-        # 복사 버튼 추가
         self.copy_btn = QPushButton("Copy")
         self.copy_btn.clicked.connect(self.copy_to_clipboard)
         btn_layout.addWidget(self.copy_btn)
@@ -100,6 +104,7 @@ class AnswerPanel(QWidget):
 
     def position_bottom_right(self):
         screen = QScreen.availableGeometry(self.screen())
+        # 패널의 높이가 텍스트 길이에 따라 달라지므로, 높이를 재계산해서 우측 하단에 정렬
         self.move(screen.width() - self.width() - 20, screen.height() - self.height() - 20)
 
     def show_result(self, result: dict, mode: str):
@@ -114,6 +119,11 @@ class AnswerPanel(QWidget):
         else:
             self.reason_label.hide()
             
+        # 🚨 추가됨: 텍스트 갱신 후 내부 위젯 크기에 맞춰 패널 전체 크기 재조정
+        self.adjustSize()
+        # 재조정된 높이를 기반으로 우측 하단 좌표 다시 계산
+        self.position_bottom_right()
+            
         self.show()
         if self.auto_close_seconds > 0:
             self.auto_close_timer.start(self.auto_close_seconds * 1000)
@@ -127,6 +137,10 @@ class AnswerPanel(QWidget):
             self.reason_label.show()
         else:
             self.reason_label.hide()
+            
+        # 🚨 추가됨: 로딩 텍스트에 맞춰 패널 크기 및 위치 갱신
+        self.adjustSize()
+        self.position_bottom_right()
             
         self.show()
         self.auto_close_timer.stop()
