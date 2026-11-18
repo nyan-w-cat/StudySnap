@@ -192,7 +192,8 @@ class StudyAssistantApp:
         model_group = QActionGroup(model_menu)
         for text, val in [("Gemini 3.5 Flash Lite", "gemini-3.5-flash-lite"), 
                           ("Gemini 3.1 Flash Lite", "gemini-3.1-flash-lite"),
-                          ("Gemini 3.8 Flash", "gemini-3.8-flash")]:
+                          ("Gemini 3.8 Flash", "gemini-3.8-flash"),
+                         ("Gemini 4 Hydrogen", "gemini-4-hydrogen")]:
             act = QAction(text, model_menu, checkable=True, checked=(self.current_model == val))
             act.triggered.connect(lambda checked, v=val: self.set_model(v))
             model_group.addAction(act)
